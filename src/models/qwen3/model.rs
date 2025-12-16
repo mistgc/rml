@@ -1,9 +1,11 @@
-use crate::models::common::Model;
+use crate::{models::common::Model, utils::sampler::MultinomialSampler};
 
 use super::config::Qwen3Config;
 use anyhow::{Result, anyhow};
-use burn::{nn, prelude::*};
-use openai_dive::v1::resources::chat::{ChatCompletionParameters, ChatCompletionResponse};
+use burn::{nn, prelude::*, tensor::activation::softmax};
+use openai_dive::v1::resources::chat::{
+    ChatCompletionParameters, ChatCompletionResponse, ChatMessage, ChatMessageContent,
+};
 use serde::de::value;
 use std::{fs, path::Path};
 use tokenizers::Tokenizer;
@@ -235,8 +237,6 @@ pub fn eager_attention_forward<B: Backend>(
     scaling: f32,
     dropout: Option<&nn::Dropout>,
 ) -> (Tensor<B, 4>, Tensor<B, 4>) {
-    use burn::tensor::activation::softmax;
-
     let key_states = repeat_kv(k.clone(), module.num_key_value_groups); // [B, N_kv, S, D] -> [B, N_head, S, D]
     let value_states = repeat_kv(v.clone(), module.num_key_value_groups); // [B, N_kv, S, D] -> [B, N_head, S, D]
     let mut attn_weights = Tensor::matmul(q, key_states.swap_dims(2, 3)).mul_scalar(scaling); // [B, N_head, S, S]
@@ -541,34 +541,66 @@ impl<B: Backend> Model for Qwen3<B> {
     }
 
     fn generate(&self, msgs: ChatCompletionParameters) -> Result<ChatCompletionResponse> {
-        for m in msgs.messages {
-            if let Some(text) = m.message() {
-                let text = text.to_string();
-                // TODO: apply chat template
-                let input_ids = self
-                    .tokenizer
-                    .encode(text, true)
-                    .map_err(|e| anyhow!(format!("Tokenizer encode err: {}", e)))?
-                    .get_ids()
-                    .to_vec();
-                let seq_len = input_ids.len();
-                let tensor_ids = Tensor::<B, 2, Int>::from_data(
-                    TensorData::new(input_ids, [1, seq_len]),
-                    &self.device,
-                );
-                let input = Self::Input {
-                    input_ids: Some(tensor_ids),
-                    attention_mask: None,
-                    inputs_embeds: None,
-                    position_ids: None,
-                    past_key_values: None,
-                    use_cache: false,
-                    cache_position: None,
-                };
+        let num_samples = msgs.max_tokens.unwrap_or(1024);
+        let random_seed = msgs.seed.unwrap_or(123456);
+        let temperature = msgs.temperature.unwrap_or(1.0);
+        let top_p = msgs.top_p.unwrap_or(1.0);
+        // TODO: top_k <- model config file (rather than the ChatCompletionParameters)
 
-                let output = self.forward(input);
-                println!("logits: {:?}", output.logits);
-            }
+        let sampler = MultinomialSampler::new();
+
+        for m in msgs.messages {
+            // match m {
+            //     ChatMessage::User { content, name } => match content {
+            //         ChatMessageContent::Text(text) => println!("{}", text),
+            //         ChatMessageContent::ContentPart(part) => match part {
+            //             for
+            //         },
+            //         ChatMessageContent::None => todo!(),
+            //     },
+            //     _ => todo!(),
+            // }
+
+            // let mut input_ids = self
+            //     .tokenizer
+            //     .encode(text.clone(), true)
+            //     .map_err(|e| anyhow!(format!("Tokenizer encode err: {}", e)))?
+            //     .get_ids()
+            //     .to_vec();
+            // for _ in 0..num_samples {
+            //     // TODO: apply chat template
+            //     let seq_len = input_ids.len();
+            //     let tensor_ids = Tensor::<B, 2, Int>::from_data(
+            //         TensorData::new(input_ids.clone(), [1, seq_len]),
+            //         &self.device,
+            //     );
+            //     let input = Self::Input {
+            //         input_ids: Some(tensor_ids),
+            //         attention_mask: None,
+            //         inputs_embeds: None,
+            //         position_ids: None,
+            //         past_key_values: None,
+            //         use_cache: false,
+            //         cache_position: None,
+            //     };
+            //
+            //     let output = self.forward(input); // logits: [B, S, C]
+            //     let probs = softmax(output.logits.slice(s!(.., -1, ..)).squeeze_dim(1), 1); // [B, C]
+            //     let next_token = sampler
+            //         .sample(probs, temperature)
+            //         .squeeze_dim::<1>(0)
+            //         .into_scalar()
+            //         .to_u32();
+            //
+            //     input_ids.push(next_token);
+            // }
+            //
+            // println!(
+            //     "{}",
+            //     self.tokenizer
+            //         .decode(input_ids.as_ref(), true)
+            //         .unwrap_or("NULL".to_owned())
+            // );
         }
 
         todo!()
