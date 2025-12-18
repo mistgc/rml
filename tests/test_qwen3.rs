@@ -1,10 +1,10 @@
 use anyhow::Result;
 use burn::backend::Wgpu;
 use burn::backend::wgpu::WgpuDevice;
+use openai_dive::v1::resources::chat::ChatCompletionParameters;
 use rml::models::Qwen3;
 use rml::models::common::Model;
 use rml::models::qwen3::model::Qwen3Input;
-use openai_dive::v1::resources::chat::ChatCompletionParameters;
 
 type Backend = Wgpu;
 type Device = WgpuDevice;
@@ -30,18 +30,13 @@ fn qwen3_generate() -> Result<()> {
             },
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Hi!"
-                    }
-                ]
+                "content": "Give me a short introduction to large language model."
             }
         ]
     }
     "#;
     let message: ChatCompletionParameters = serde_json::from_str(message)?;
-    model.generate(message);
+    model.generate(message)?;
 
     Ok(())
 }

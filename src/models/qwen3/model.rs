@@ -1,10 +1,12 @@
-use crate::{models::common::Model, utils::sampler::MultinomialSampler};
+use crate::{
+    chat_template::ChatTemplate, models::common::Model, utils::sampler::MultinomialSampler,
+};
 
 use super::config::Qwen3Config;
 use anyhow::{Result, anyhow};
 use burn::{nn, prelude::*, tensor::activation::softmax};
 use openai_dive::v1::resources::chat::{
-    ChatCompletionParameters, ChatCompletionResponse, ChatMessage, ChatMessageContent,
+    ChatCompletionParameters, ChatCompletionResponse,
 };
 use serde::de::value;
 use std::{fs, path::Path};
@@ -489,12 +491,14 @@ pub struct Qwen3<B: Backend> {
     config: Qwen3Config,
     lm_head: nn::Linear<B>,
     device: B::Device,
+    chat_template: ChatTemplate,
 }
 
 impl<B: Backend> Qwen3<B> {
     pub fn new<P: AsRef<Path>>(model_path: P, device: &B::Device) -> Result<Self> {
         let config_path = Path::join(model_path.as_ref(), "config.json");
         let tokenizer_path = Path::join(model_path.as_ref(), "tokenizer.json");
+        let chat_template = ChatTemplate::new(model_path)?;
 
         let tokenizer = Qwen3::<B>::create_tokenizer(tokenizer_path)?;
         let config = Qwen3::<B>::create_config(config_path)?;
@@ -504,6 +508,7 @@ impl<B: Backend> Qwen3<B> {
             .init::<B>(device);
 
         Ok(Self {
+            chat_template,
             model,
             tokenizer,
             config: config.clone(),
@@ -512,14 +517,14 @@ impl<B: Backend> Qwen3<B> {
         })
     }
 
-    fn create_config<P: AsRef<Path>>(path: P) -> Result<Qwen3Config> {
+    pub fn create_config<P: AsRef<Path>>(path: P) -> Result<Qwen3Config> {
         let config_json_str = fs::read_to_string(path)?;
         let config: Qwen3Config = serde_json::from_str(&config_json_str)?;
 
         Ok(config)
     }
 
-    fn create_tokenizer<P: AsRef<Path>>(path: P) -> Result<Tokenizer> {
+    pub fn create_tokenizer<P: AsRef<Path>>(path: P) -> Result<Tokenizer> {
         let tokenizer = Tokenizer::from_file(path).map_err(|e| anyhow::anyhow!(e))?;
 
         Ok(tokenizer)
@@ -548,60 +553,49 @@ impl<B: Backend> Model for Qwen3<B> {
         // TODO: top_k <- model config file (rather than the ChatCompletionParameters)
 
         let sampler = MultinomialSampler::new();
+        let rendered_text = self.chat_template.render(&msgs)?;
 
-        for m in msgs.messages {
-            // match m {
-            //     ChatMessage::User { content, name } => match content {
-            //         ChatMessageContent::Text(text) => println!("{}", text),
-            //         ChatMessageContent::ContentPart(part) => match part {
-            //             for
-            //         },
-            //         ChatMessageContent::None => todo!(),
-            //     },
-            //     _ => todo!(),
-            // }
+        let mut input_ids = self
+            .tokenizer
+            .encode(rendered_text.clone(), true)
+            .map_err(|e| anyhow!(format!("Tokenizer encode err: {}", e)))?
+            .get_ids()
+            .to_vec();
 
-            // let mut input_ids = self
-            //     .tokenizer
-            //     .encode(text.clone(), true)
-            //     .map_err(|e| anyhow!(format!("Tokenizer encode err: {}", e)))?
-            //     .get_ids()
-            //     .to_vec();
-            // for _ in 0..num_samples {
-            //     // TODO: apply chat template
-            //     let seq_len = input_ids.len();
-            //     let tensor_ids = Tensor::<B, 2, Int>::from_data(
-            //         TensorData::new(input_ids.clone(), [1, seq_len]),
-            //         &self.device,
-            //     );
-            //     let input = Self::Input {
-            //         input_ids: Some(tensor_ids),
-            //         attention_mask: None,
-            //         inputs_embeds: None,
-            //         position_ids: None,
-            //         past_key_values: None,
-            //         use_cache: false,
-            //         cache_position: None,
-            //     };
-            //
-            //     let output = self.forward(input); // logits: [B, S, C]
-            //     let probs = softmax(output.logits.slice(s!(.., -1, ..)).squeeze_dim(1), 1); // [B, C]
-            //     let next_token = sampler
-            //         .sample(probs, temperature)
-            //         .squeeze_dim::<1>(0)
-            //         .into_scalar()
-            //         .to_u32();
-            //
-            //     input_ids.push(next_token);
-            // }
-            //
-            // println!(
-            //     "{}",
-            //     self.tokenizer
-            //         .decode(input_ids.as_ref(), true)
-            //         .unwrap_or("NULL".to_owned())
-            // );
+        for _ in 0..num_samples {
+            // TODO: apply chat template
+            let seq_len = input_ids.len();
+            let tensor_ids = Tensor::<B, 2, Int>::from_data(
+                TensorData::new(input_ids.clone(), [1, seq_len]),
+                &self.device,
+            );
+            let input = Self::Input {
+                input_ids: Some(tensor_ids),
+                attention_mask: None,
+                inputs_embeds: None,
+                position_ids: None,
+                past_key_values: None,
+                use_cache: false,
+                cache_position: None,
+            };
+
+            let output = self.forward(input); // logits: [B, S, C]
+            let probs = softmax(output.logits.slice(s!(.., -1, ..)).squeeze_dim(1), 1); // [B, C]
+            let next_token = sampler
+                .sample(probs)
+                .squeeze_dim::<1>(0)
+                .into_scalar()
+                .to_u32();
+
+            input_ids.push(next_token);
         }
+
+        println!(
+            "{}",
+            self.tokenizer
+                .decode(input_ids.as_ref(), true)
+                .unwrap_or("NULL".to_owned())
+        );
 
         todo!()
     }

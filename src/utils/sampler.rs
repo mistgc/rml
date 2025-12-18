@@ -10,9 +10,8 @@ impl MultinomialSampler {
     pub fn sample<B: Backend>(
         &self,
         probs: Tensor<B, 2, Float>,
-        temperature: f32,
     ) -> Tensor<B, 2, Int> {
-        let [batch_size, num_classes] = probs.dims();
+        let [batch_size, _] = probs.dims();
         let unif = Tensor::<B, 2, Float>::random(
             [batch_size, 1],
             Distribution::Uniform(0.0, 1.0),

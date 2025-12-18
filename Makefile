@@ -12,7 +12,7 @@ build:
 
 test:
 	@echo "Running tests..."
-	@cargo test
+	@RUST_BACKTRACE=1 cargo test
 
 clean:
 	@echo "Cleaning project..."
