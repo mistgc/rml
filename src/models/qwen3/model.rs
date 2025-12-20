@@ -1,27 +1,35 @@
 use crate::{
-    chat_template::ChatTemplate, models::common::Model, utils::sampler::MultinomialSampler,
+    chat_template::ChatTemplate,
+    models::common::Model,
+    utils::sampler::{MultinomialSampler, SimpleSampler},
 };
 
 use super::config::Qwen3Config;
 use anyhow::{Result, anyhow};
-use burn::{nn, prelude::*, tensor::activation::softmax};
-use openai_dive::v1::resources::chat::{
-    ChatCompletionParameters, ChatCompletionResponse,
+use burn::{
+    module::{Param, ParamId},
+    nn,
+    prelude::*,
+    record::{FullPrecisionSettings, HalfPrecisionSettings, Record, Recorder, RecorderError},
+    tensor::activation::softmax,
 };
-use serde::de::value;
+
+use burn_import::safetensors::{LoadArgs, SafetensorsFileRecorder};
+use openai_dive::v1::resources::chat::{ChatCompletionParameters, ChatCompletionResponse};
 use std::{fs, path::Path};
 use tokenizers::Tokenizer;
 
+#[derive(Module, Debug)]
 pub struct Qwen3RMSNorm<B: Backend> {
     variance_epsilon: f32,
-    weight: Tensor<B, 1>, // [hidden_size]
+    weight: Param<Tensor<B, 1>>, // [hidden_size]
 }
 
 impl<B: Backend> Qwen3RMSNorm<B> {
     pub fn new(hidden_size: usize, eps: f32, device: &B::Device) -> Self {
         Self {
             variance_epsilon: eps,
-            weight: Tensor::ones([hidden_size], device),
+            weight: Param::initialized(ParamId::new(), Tensor::ones([hidden_size], device)),
         }
     }
 
@@ -39,67 +47,13 @@ impl<B: Backend> Qwen3RMSNorm<B> {
         let normalized = hidden_states_f32 / norm;
 
         // cast 回原始 dtype 并 apply learnable scale (self.weight 自动广播)
-        let scaled = self.weight.clone().unsqueeze() * normalized;
+        let scaled = self.weight.val().unsqueeze() * normalized;
 
         scaled.cast(input_dtype)
     }
 }
 
-pub fn rope_init_fn<B: Backend>(config: &Qwen3Config, device: &B::Device) -> (Tensor<B, 1>, f32) {
-    let base = Tensor::from_data([config.rope_theta], device);
-    let dim = config
-        .head_dim
-        .unwrap_or(config.hidden_size / config.num_attention_heads) as i64;
-    let attention_factor: f32 = 1.0;
-    let exp = Tensor::<B, 1, Int>::arange_step(0..dim, 2, device).float();
-    let inv_freq = Tensor::from_data([1.0], device).div(base.powf(exp));
-
-    (inv_freq, attention_factor)
-}
-
-pub struct Qwen3RotaryEmbedding<B: Backend> {
-    rope_theta: usize,
-    rope_scaling: Option<usize>,
-    original_inv_freq: Tensor<B, 1>,
-    attention_scaling: f32,
-}
-
-impl<B: Backend> Qwen3RotaryEmbedding<B> {
-    pub fn new(config: &Qwen3Config, device: &B::Device) -> Self {
-        let (inv_freq, attention_scaling) = rope_init_fn::<B>(config, device);
-
-        Self {
-            rope_theta: config.rope_theta,
-            rope_scaling: config.rope_scaling.clone(),
-            original_inv_freq: inv_freq,
-            attention_scaling,
-        }
-    }
-
-    pub fn forward(
-        &self,
-        inputs: Tensor<B, 3>,
-        position_ids: Tensor<B, 2, Int>,
-    ) -> (Tensor<B, 3>, Tensor<B, 3>) {
-        let expanding_shape = [position_ids.shape()[0] as i32, -1, 1];
-        let inv_freq_expanded = self
-            .original_inv_freq
-            .clone()
-            .unsqueeze_dims::<3>(&[0, -1])
-            .expand(expanding_shape);
-        let position_ids_expanded = position_ids.unsqueeze_dims::<3>(&[1]);
-
-        let freqs = inv_freq_expanded
-            .matmul(position_ids_expanded.float())
-            .swap_dims(1, 2);
-        let emb = Tensor::cat(vec![freqs.clone(), freqs], 2);
-        let cos = emb.clone().cos() * self.attention_scaling;
-        let sin = emb.sin() * self.attention_scaling;
-
-        (cos, sin)
-    }
-}
-
+#[derive(Module, Debug)]
 pub struct Qwen3Attention<B: Backend> {
     q_proj: nn::Linear<B>,
     k_proj: nn::Linear<B>,
@@ -267,6 +221,40 @@ pub fn rotate_half<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> 
     Tensor::cat(vec![x2_neg, x1], D - 1)
 }
 
+pub fn rope_init_fn<B: Backend>(config: &Qwen3Config, device: &B::Device) -> (Tensor<B, 1>, f32) {
+    let base = Tensor::from_data([config.rope_theta], device);
+    let dim = config
+        .head_dim
+        .unwrap_or(config.hidden_size / config.num_attention_heads) as i64;
+    let attention_factor: f32 = 1.0;
+    let exp = Tensor::<B, 1, Int>::arange_step(0..dim, 2, device).float();
+    let inv_freq = Tensor::from_data([1.0], device).div(base.powf(exp));
+
+    (inv_freq, attention_factor)
+}
+
+pub fn generate_rope_modulation_functions<B: Backend>(
+    position_ids: Tensor<B, 2, Int>,
+    original_inv_freq: Tensor<B, 1>,
+    attention_scaling: f32,
+) -> (Tensor<B, 3>, Tensor<B, 3>) {
+    let expanding_shape = [position_ids.shape()[0] as i32, -1, 1];
+    let inv_freq_expanded = original_inv_freq
+        .clone()
+        .unsqueeze_dims::<3>(&[0, -1])
+        .expand(expanding_shape);
+    let position_ids_expanded = position_ids.unsqueeze_dims::<3>(&[1]);
+
+    let freqs = inv_freq_expanded
+        .matmul(position_ids_expanded.float())
+        .swap_dims(1, 2);
+    let emb = Tensor::cat(vec![freqs.clone(), freqs], 2);
+    let cos = emb.clone().cos() * attention_scaling;
+    let sin = emb.sin() * attention_scaling;
+
+    (cos, sin)
+}
+
 pub fn apply_rotary_pos_emb<B: Backend>(
     q: Tensor<B, 4>,
     k: Tensor<B, 4>,
@@ -284,13 +272,13 @@ pub fn apply_rotary_pos_emb<B: Backend>(
     (q_embed, k_embed)
 }
 
+#[derive(Module, Debug)]
 pub struct Qwen3MLP<B: Backend, const D: usize> {
     hidden_size: usize,
     intermidiate_size: usize,
     gate_proj: nn::Linear<B>,
     up_proj: nn::Linear<B>,
     down_proj: nn::Linear<B>,
-    act_fn: fn(Tensor<B, D>) -> Tensor<B, D>,
 }
 
 impl<B: Backend, const D: usize> Qwen3MLP<B, D> {
@@ -307,13 +295,14 @@ impl<B: Backend, const D: usize> Qwen3MLP<B, D> {
             down_proj: nn::LinearConfig::new(config.intermediate_size, config.hidden_size)
                 .with_bias(false)
                 .init(device),
-            act_fn: burn::tensor::activation::silu::<D, B>,
         }
     }
 
     pub fn forward(&self, inputs: Tensor<B, D>) -> Tensor<B, D> {
+        let act_fn = burn::tensor::activation::silu::<D, B>;
+
         let x = self.gate_proj.forward(inputs.clone());
-        let x = (self.act_fn)(x);
+        let x = (act_fn)(x);
         let x = x * self.up_proj.forward(inputs);
         let y = self.down_proj.forward(x);
 
@@ -321,6 +310,7 @@ impl<B: Backend, const D: usize> Qwen3MLP<B, D> {
     }
 }
 
+#[derive(Module, Debug)]
 pub struct Qwen3DecoderLayerInput<B: Backend> {
     hidden_states: Tensor<B, 3>,
     position_embeddings: (Tensor<B, 3>, Tensor<B, 3>),
@@ -331,6 +321,7 @@ pub struct Qwen3DecoderLayerInput<B: Backend> {
     past_key_values: Option<Tensor<B, 2>>,
 }
 
+#[derive(Module, Debug)]
 pub struct Qwen3DecoderLayer<B: Backend> {
     hidden_size: usize,
     self_attn: Qwen3Attention<B>,
@@ -383,18 +374,18 @@ impl<B: Backend> Qwen3DecoderLayer<B> {
     }
 }
 
-pub struct Qwen3Model<B: Backend> {
+#[derive(Module, Debug)]
+pub struct Qwen3ModelInner<B: Backend> {
     padding_idx: usize,
     vocab_size: usize,
     embed_tokens: nn::Embedding<B>,
     layers: Vec<Qwen3DecoderLayer<B>>,
     norm: Qwen3RMSNorm<B>,
-    rotary_emb: Qwen3RotaryEmbedding<B>,
-    gradient_checkpointing: bool,
-    device: B::Device,
+    original_inv_freq: Tensor<B, 1>,
+    attention_scaling: f32,
 }
 
-impl<B: Backend> Qwen3Model<B> {
+impl<B: Backend> Qwen3ModelInner<B> {
     pub fn new(config: &Qwen3Config, device: &B::Device) -> Self {
         let mut layers: Vec<Qwen3DecoderLayer<B>> = vec![];
 
@@ -402,20 +393,21 @@ impl<B: Backend> Qwen3Model<B> {
             layers.push(Qwen3DecoderLayer::<B>::new(config, idx, device));
         }
 
+        let (original_inv_freq, attention_scaling) = rope_init_fn(config, device);
+
         Self {
-            device: device.clone(),
+            original_inv_freq,
+            attention_scaling,
             padding_idx: config.pad_token_id,
             vocab_size: config.vocab_size,
             embed_tokens: nn::EmbeddingConfig::new(config.vocab_size, config.hidden_size)
                 .init::<B>(device),
             layers,
             norm: Qwen3RMSNorm::<B>::new(config.hidden_size, config.rms_norm_eps, device),
-            rotary_emb: Qwen3RotaryEmbedding::<B>::new(config, device),
-            gradient_checkpointing: false,
         }
     }
 
-    pub fn forward(&self, inputs: Qwen3Input<B>) -> (Tensor<B, 3>, Option<Tensor<B, 2>>) {
+    pub fn forward(&self, inputs: Qwen3ModelInput<B>) -> (Tensor<B, 3>, Option<Tensor<B, 2>>) {
         let inputs_embeds = inputs.inputs_embeds.unwrap_or_else(|| {
             let input_ids = inputs.input_ids.unwrap_or_else(|| {
                 panic!("You must specify exactly one of input_ids or inputs_embeds")
@@ -437,7 +429,7 @@ impl<B: Backend> Qwen3Model<B> {
 
             Tensor::<B, 1, Int>::arange(
                 num_past_seen_tokens..(num_past_seen_tokens + inputs_embeds.dims()[1].to_i64()),
-                &self.device,
+                &inputs_embeds.device(),
             )
         });
 
@@ -446,9 +438,11 @@ impl<B: Backend> Qwen3Model<B> {
             .unwrap_or(cache_position.clone().unsqueeze_dim(0));
 
         let mut hidden_states = inputs_embeds;
-        let position_embeddings = self
-            .rotary_emb
-            .forward(hidden_states.clone(), position_ids.clone());
+        let position_embeddings = generate_rope_modulation_functions(
+            position_ids.clone(),
+            self.original_inv_freq.clone(),
+            self.attention_scaling,
+        );
 
         self.layers.iter().for_each(|layer| {
             // FIXME: past_key_values needs to a new struct, and here its reference should be passed in.
@@ -470,7 +464,7 @@ impl<B: Backend> Qwen3Model<B> {
     }
 }
 
-pub struct Qwen3Input<B: Backend> {
+pub struct Qwen3ModelInput<B: Backend> {
     pub input_ids: Option<Tensor<B, 2, Int>>, // [B, S], dtype: u32
     pub attention_mask: Option<Tensor<B, 2>>,
     pub position_ids: Option<Tensor<B, 2, Int>>,
@@ -480,40 +474,69 @@ pub struct Qwen3Input<B: Backend> {
     pub cache_position: Option<Tensor<B, 1, Int>>,
 }
 
-pub struct Qwen3Output<B: Backend> {
+pub struct Qwen3ModelOutput<B: Backend> {
     logits: Tensor<B, 3>,
     past_key_values: Option<Tensor<B, 2>>,
 }
 
-pub struct Qwen3<B: Backend> {
-    model: Qwen3Model<B>,
-    tokenizer: Tokenizer,
-    config: Qwen3Config,
+#[derive(Module, Debug)]
+pub struct Qwen3Model<B: Backend> {
     lm_head: nn::Linear<B>,
-    device: B::Device,
+    model: Qwen3ModelInner<B>,
+}
+
+impl<B: Backend> Qwen3Model<B> {
+    pub fn new(config: &Qwen3Config, device: &B::Device) -> Self {
+        let model = Qwen3ModelInner::new(&config, device);
+        let lm_head = nn::LinearConfig::new(config.hidden_size, config.vocab_size)
+            .with_bias(false)
+            .init::<B>(device);
+
+        Self { model, lm_head }
+    }
+
+    pub fn forward(&self, input: Qwen3ModelInput<B>) -> Qwen3ModelOutput<B> {
+        let (hidden_states, past_key_values) = self.model.forward(input);
+        let logits = self.lm_head.forward(hidden_states);
+
+        Qwen3ModelOutput {
+            logits,
+            past_key_values,
+        }
+    }
+}
+
+pub struct Qwen3<B: Backend> {
+    tokenizer: Tokenizer,
     chat_template: ChatTemplate,
+    model: Qwen3Model<B>,
+    device: B::Device,
 }
 
 impl<B: Backend> Qwen3<B> {
     pub fn new<P: AsRef<Path>>(model_path: P, device: &B::Device) -> Result<Self> {
         let config_path = Path::join(model_path.as_ref(), "config.json");
         let tokenizer_path = Path::join(model_path.as_ref(), "tokenizer.json");
-        let chat_template = ChatTemplate::new(model_path)?;
+        let model_ckpt_path = Path::join(model_path.as_ref(), "model.safetensors");
 
+        let chat_template = ChatTemplate::new(model_path)?;
         let tokenizer = Qwen3::<B>::create_tokenizer(tokenizer_path)?;
         let config = Qwen3::<B>::create_config(config_path)?;
-        let model = Qwen3Model::new(&config, device);
-        let lm_head = nn::LinearConfig::new(config.hidden_size, config.vocab_size)
-            .with_bias(false)
-            .init::<B>(device);
+        let mut load_args = LoadArgs::new(model_ckpt_path);
+        // load_args.debug = true;
+
+        let record = SafetensorsFileRecorder::<HalfPrecisionSettings>::default()
+            .load(load_args, device)
+            .expect("Should decode state successfully");
+
+        let model: Qwen3Model<B> = Qwen3Model::new(&config, device);
+        let model = model.load_record(record);
 
         Ok(Self {
-            chat_template,
-            model,
             tokenizer,
-            config: config.clone(),
-            lm_head,
             device: device.clone(),
+            model,
+            chat_template,
         })
     }
 
@@ -532,27 +555,15 @@ impl<B: Backend> Qwen3<B> {
 }
 
 impl<B: Backend> Model for Qwen3<B> {
-    type Input = Qwen3Input<B>;
-    type Output = Qwen3Output<B>;
-
-    fn forward(&self, input: Self::Input) -> Self::Output {
-        let (hidden_states, past_key_values) = self.model.forward(input);
-        let logits = self.lm_head.forward(hidden_states);
-
-        Self::Output {
-            logits,
-            past_key_values,
-        }
-    }
-
     fn generate(&self, msgs: ChatCompletionParameters) -> Result<ChatCompletionResponse> {
-        let num_samples = msgs.max_tokens.unwrap_or(1024);
+        let num_samples = msgs.max_tokens.unwrap_or(10);
         let random_seed = msgs.seed.unwrap_or(123456);
         let temperature = msgs.temperature.unwrap_or(1.0);
         let top_p = msgs.top_p.unwrap_or(1.0);
         // TODO: top_k <- model config file (rather than the ChatCompletionParameters)
 
         let sampler = MultinomialSampler::new();
+        // let sampler = SimpleSampler::new();
         let rendered_text = self.chat_template.render(&msgs)?;
 
         let mut input_ids = self
@@ -569,7 +580,7 @@ impl<B: Backend> Model for Qwen3<B> {
                 TensorData::new(input_ids.clone(), [1, seq_len]),
                 &self.device,
             );
-            let input = Self::Input {
+            let input = Qwen3ModelInput {
                 input_ids: Some(tensor_ids),
                 attention_mask: None,
                 inputs_embeds: None,
@@ -579,7 +590,7 @@ impl<B: Backend> Model for Qwen3<B> {
                 cache_position: None,
             };
 
-            let output = self.forward(input); // logits: [B, S, C]
+            let output = self.model.forward(input); // logits: [B, S, C]
             let probs = softmax(output.logits.slice(s!(.., -1, ..)).squeeze_dim(1), 1); // [B, C]
             let next_token = sampler
                 .sample(probs)

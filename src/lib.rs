@@ -1,6 +1,6 @@
+pub mod chat_template;
 pub mod models;
 pub mod utils;
-pub mod chat_template;
 
 pub fn add(left: u64, right: u64) -> u64 {
     left + right

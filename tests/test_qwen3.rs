@@ -1,10 +1,11 @@
+#![recursion_limit = "256"]
+
 use anyhow::Result;
 use burn::backend::Wgpu;
 use burn::backend::wgpu::WgpuDevice;
 use openai_dive::v1::resources::chat::ChatCompletionParameters;
-use rml::models::Qwen3;
 use rml::models::common::Model;
-use rml::models::qwen3::model::Qwen3Input;
+use rml::models::qwen3::model::Qwen3;
 
 type Backend = Wgpu;
 type Device = WgpuDevice;
