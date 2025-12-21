@@ -1,7 +1,5 @@
 use crate::{
-    chat_template::ChatTemplate,
-    models::common::Model,
-    utils::sampler::{MultinomialSampler, SimpleSampler},
+    chat_template::ChatTemplate, models::common::Model, safetensors_helper::SafeTensorsHelper, utils::sampler::MultinomialSampler
 };
 
 use super::config::Qwen3Config;
@@ -10,11 +8,11 @@ use burn::{
     module::{Param, ParamId},
     nn,
     prelude::*,
-    record::{FullPrecisionSettings, HalfPrecisionSettings, Record, Recorder, RecorderError},
+    record::{HalfPrecisionSettings, Recorder},
     tensor::activation::softmax,
 };
 
-use burn_import::safetensors::{LoadArgs, SafetensorsFileRecorder};
+use burn_import::safetensors::{AdapterType, LoadArgs, SafetensorsFileRecorder};
 use openai_dive::v1::resources::chat::{ChatCompletionParameters, ChatCompletionResponse};
 use std::{fs, path::Path};
 use tokenizers::Tokenizer;
@@ -59,8 +57,8 @@ pub struct Qwen3Attention<B: Backend> {
     k_proj: nn::Linear<B>,
     v_proj: nn::Linear<B>,
     o_proj: nn::Linear<B>,
-    q_norm: Qwen3RMSNorm<B>,
-    k_norm: Qwen3RMSNorm<B>,
+    q_norm: nn::RmsNorm<B>,
+    k_norm: nn::RmsNorm<B>,
     layer_idx: usize,
     num_key_value_groups: usize,
     head_dim: usize,
@@ -103,8 +101,12 @@ impl<B: Backend> Qwen3Attention<B> {
             )
             .with_bias(config.attention_bias)
             .init(device),
-            q_norm: Qwen3RMSNorm::new(head_dim, config.rms_norm_eps, device),
-            k_norm: Qwen3RMSNorm::new(head_dim, config.rms_norm_eps, device),
+            q_norm: nn::RmsNormConfig::new(head_dim)
+                .with_epsilon(config.rms_norm_eps as f64)
+                .init(device),
+            k_norm: nn::RmsNormConfig::new(head_dim)
+                .with_epsilon(config.rms_norm_eps as f64)
+                .init(device),
         }
     }
 
@@ -326,8 +328,8 @@ pub struct Qwen3DecoderLayer<B: Backend> {
     hidden_size: usize,
     self_attn: Qwen3Attention<B>,
     mlp: Qwen3MLP<B, 3>,
-    input_layernorm: Qwen3RMSNorm<B>,
-    post_attention_layernorm: Qwen3RMSNorm<B>,
+    input_layernorm: nn::RmsNorm<B>,
+    post_attention_layernorm: nn::RmsNorm<B>,
 }
 
 impl<B: Backend> Qwen3DecoderLayer<B> {
@@ -336,16 +338,12 @@ impl<B: Backend> Qwen3DecoderLayer<B> {
             hidden_size: config.hidden_size,
             self_attn: Qwen3Attention::<B>::new(config, layer_idx, device),
             mlp: Qwen3MLP::<B, 3>::new(config, device),
-            input_layernorm: Qwen3RMSNorm::<B>::new(
-                config.hidden_size,
-                config.rms_norm_eps,
-                device,
-            ),
-            post_attention_layernorm: Qwen3RMSNorm::<B>::new(
-                config.hidden_size,
-                config.rms_norm_eps,
-                device,
-            ),
+            input_layernorm: nn::RmsNormConfig::new(config.hidden_size)
+                .with_epsilon(config.rms_norm_eps as f64)
+                .init(device),
+            post_attention_layernorm: nn::RmsNormConfig::new(config.hidden_size)
+                .with_epsilon(config.rms_norm_eps as f64)
+                .init(device),
         }
     }
 
@@ -380,7 +378,7 @@ pub struct Qwen3ModelInner<B: Backend> {
     vocab_size: usize,
     embed_tokens: nn::Embedding<B>,
     layers: Vec<Qwen3DecoderLayer<B>>,
-    norm: Qwen3RMSNorm<B>,
+    norm: nn::RmsNorm<B>,
     original_inv_freq: Tensor<B, 1>,
     attention_scaling: f32,
 }
@@ -403,7 +401,9 @@ impl<B: Backend> Qwen3ModelInner<B> {
             embed_tokens: nn::EmbeddingConfig::new(config.vocab_size, config.hidden_size)
                 .init::<B>(device),
             layers,
-            norm: Qwen3RMSNorm::<B>::new(config.hidden_size, config.rms_norm_eps, device),
+            norm: nn::RmsNormConfig::new(config.hidden_size)
+                .with_epsilon(config.rms_norm_eps as f64)
+                .init(device),
         }
     }
 
@@ -504,6 +504,14 @@ impl<B: Backend> Qwen3Model<B> {
             past_key_values,
         }
     }
+
+    /// Load the `.safetensors` file
+    pub fn from_pretrained<P: AsRef<Path>>(self, path: P) -> Self {
+        let model_weights = SafeTensorsHelper::new(path);
+        println!("{:?}", model_weights);
+
+        todo!()
+    }
 }
 
 pub struct Qwen3<B: Backend> {
@@ -522,15 +530,9 @@ impl<B: Backend> Qwen3<B> {
         let chat_template = ChatTemplate::new(model_path)?;
         let tokenizer = Qwen3::<B>::create_tokenizer(tokenizer_path)?;
         let config = Qwen3::<B>::create_config(config_path)?;
-        let mut load_args = LoadArgs::new(model_ckpt_path);
-        // load_args.debug = true;
 
-        let record = SafetensorsFileRecorder::<HalfPrecisionSettings>::default()
-            .load(load_args, device)
-            .expect("Should decode state successfully");
-
-        let model: Qwen3Model<B> = Qwen3Model::new(&config, device);
-        let model = model.load_record(record);
+        let model: Qwen3Model<B> =
+            Qwen3Model::new(&config, device).from_pretrained(model_ckpt_path);
 
         Ok(Self {
             tokenizer,
@@ -574,7 +576,6 @@ impl<B: Backend> Model for Qwen3<B> {
             .to_vec();
 
         for _ in 0..num_samples {
-            // TODO: apply chat template
             let seq_len = input_ids.len();
             let tensor_ids = Tensor::<B, 2, Int>::from_data(
                 TensorData::new(input_ids.clone(), [1, seq_len]),
