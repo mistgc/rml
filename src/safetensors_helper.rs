@@ -1,4 +1,7 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use burn::{
+    tensor::TensorData,
+};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -32,6 +35,16 @@ impl SafeTensorsHelper {
         })
     }
 
+    pub fn get(&self, key: &str) -> Result<TensorData> {
+        let value = self
+            .map
+            .get(key)
+            .ok_or_else(|| anyhow!(format!("The key {} is invalid.", key)))?;
+        let tensor = value.clone();
+
+        Ok(tensor)
+    }
+
     fn convert_dtype(dtype: safetensors::Dtype) -> burn::tensor::DType {
         match dtype {
             safetensors::Dtype::BOOL => burn::tensor::DType::Bool,
@@ -58,5 +71,4 @@ impl SafeTensorsHelper {
 }
 
 #[test]
-fn test_safetensors_helper() {
-}
+fn test_safetensors_helper() {}

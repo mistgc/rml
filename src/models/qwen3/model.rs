@@ -1,5 +1,6 @@
 use crate::{
-    chat_template::ChatTemplate, models::common::Model, safetensors_helper::SafeTensorsHelper, utils::sampler::MultinomialSampler
+    chat_template::ChatTemplate, models::common::Model, safetensors_helper::SafeTensorsHelper,
+    utils::sampler::MultinomialSampler,
 };
 
 use super::config::Qwen3Config;
@@ -8,11 +9,10 @@ use burn::{
     module::{Param, ParamId},
     nn,
     prelude::*,
-    record::{HalfPrecisionSettings, Recorder},
     tensor::activation::softmax,
 };
 
-use burn_import::safetensors::{AdapterType, LoadArgs, SafetensorsFileRecorder};
+
 use openai_dive::v1::resources::chat::{ChatCompletionParameters, ChatCompletionResponse};
 use std::{fs, path::Path};
 use tokenizers::Tokenizer;
@@ -114,11 +114,11 @@ impl<B: Backend> Qwen3Attention<B> {
         &self,
         hidden_states: Tensor<B, 3>, // [B, S, H]
         position_embeddings: (Tensor<B, 3>, Tensor<B, 3>),
-        position_ids: Tensor<B, 2, Int>,
-        use_cache: bool,
+        _position_ids: Tensor<B, 2, Int>,
+        _use_cache: bool,
         attention_mask: Option<Tensor<B, 2>>,
-        past_key_values: Option<Tensor<B, 2>>,
-        cache_position: Option<Tensor<B, 1, Int>>,
+        _past_key_values: Option<Tensor<B, 2>>,
+        _cache_position: Option<Tensor<B, 1, Int>>,
     ) -> (Tensor<B, 3>, Option<Tensor<B, 4>>) {
         let input_shape = hidden_states.shape(); // [B, S, H]
         let hidden_shape: [i32; 4] = [
@@ -506,11 +506,198 @@ impl<B: Backend> Qwen3Model<B> {
     }
 
     /// Load the `.safetensors` file
-    pub fn from_pretrained<P: AsRef<Path>>(self, path: P) -> Self {
-        let model_weights = SafeTensorsHelper::new(path);
-        println!("{:?}", model_weights);
+    pub fn from_pretrained<P: AsRef<Path>>(mut self, path: P, device: &B::Device) -> Result<Self> {
+        let weights = SafeTensorsHelper::new(path)?;
 
-        todo!()
+        self.load_lm_head(&weights, device)?;
+        self.load_model(&weights, device)?;
+
+        // println!("{:?}", weights);
+
+        Ok(self)
+    }
+
+    fn load_lm_head(&mut self, weights: &SafeTensorsHelper, device: &B::Device) -> Result<()> {
+        self.lm_head.weight = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 2, Float>::from_data(weights.get("lm_head.weight")?, device).transpose(),
+        );
+
+        Ok(())
+    }
+
+    fn load_model(&mut self, weights: &SafeTensorsHelper, device: &B::Device) -> Result<()> {
+        let n_layers = self.model.layers.len();
+
+        for i in 0..n_layers {
+            self.load_layer(i, weights, device)?;
+        }
+
+        self.load_embed_token(weights, device)?;
+        self.load_rms_norm(weights, device)?;
+
+        Ok(())
+    }
+
+    fn load_embed_token(
+        &mut self,
+        weights: &SafeTensorsHelper,
+        device: &B::Device,
+    ) -> Result<()> {
+        self.model.embed_tokens.weight = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 2, Float>::from_data(weights.get("model.embed_tokens.weight")?, device),
+        );
+
+        Ok(())
+    }
+
+    fn load_layer(
+        &mut self,
+        layer_id: usize,
+        weights: &SafeTensorsHelper,
+        device: &B::Device,
+    ) -> Result<()> {
+        self.load_attn(layer_id, weights, device)?;
+        self.load_mlp(layer_id, weights, device)?;
+        self.load_input_layernorm_at_layer(layer_id, weights, device)?;
+        self.load_post_attention_layernorm_at_layer(layer_id, weights, device)?;
+
+        Ok(())
+    }
+
+    fn load_attn(
+        &mut self,
+        layer_id: usize,
+        weights: &SafeTensorsHelper,
+        device: &B::Device,
+    ) -> Result<()> {
+        let layer_prefix = format!("model.layers.{}", layer_id);
+        let attn_prefix = format!("{}.self_attn", layer_prefix);
+
+        // Load attention projections
+        self.model.layers[layer_id].self_attn.q_proj.weight = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 2, Float>::from_data(
+                weights.get(&format!("{}.q_proj.weight", attn_prefix))?, device
+            ).transpose(),
+        );
+
+        self.model.layers[layer_id].self_attn.k_proj.weight = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 2, Float>::from_data(
+                weights.get(&format!("{}.k_proj.weight", attn_prefix))?, device
+            ).transpose(),
+        );
+
+        self.model.layers[layer_id].self_attn.v_proj.weight = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 2, Float>::from_data(
+                weights.get(&format!("{}.v_proj.weight", attn_prefix))?, device
+            ).transpose(),
+        );
+
+        self.model.layers[layer_id].self_attn.o_proj.weight = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 2, Float>::from_data(
+                weights.get(&format!("{}.o_proj.weight", attn_prefix))?, device
+            ).transpose(),
+        );
+
+        // Load RMS norm weights
+        self.model.layers[layer_id].self_attn.q_norm.gamma = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 1, Float>::from_data(
+                weights.get(&format!("{}.q_norm.weight", attn_prefix))?, device
+            ),
+        );
+
+        self.model.layers[layer_id].self_attn.k_norm.gamma = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 1, Float>::from_data(
+                weights.get(&format!("{}.k_norm.weight", attn_prefix))?, device
+            ),
+        );
+
+        Ok(())
+    }
+
+    fn load_mlp(
+        &mut self,
+        layer_id: usize,
+        weights: &SafeTensorsHelper,
+        device: &B::Device,
+    ) -> Result<()> {
+        let layer_prefix = format!("model.layers.{}", layer_id);
+        let mlp_prefix = format!("{}.mlp", layer_prefix);
+
+        self.model.layers[layer_id].mlp.gate_proj.weight = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 2, Float>::from_data(
+                weights.get(&format!("{}.gate_proj.weight", mlp_prefix))?, device
+            ).transpose(),
+        );
+
+        self.model.layers[layer_id].mlp.up_proj.weight = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 2, Float>::from_data(
+                weights.get(&format!("{}.up_proj.weight", mlp_prefix))?, device
+            ).transpose(),
+        );
+
+        self.model.layers[layer_id].mlp.down_proj.weight = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 2, Float>::from_data(
+                weights.get(&format!("{}.down_proj.weight", mlp_prefix))?, device
+            ).transpose(),
+        );
+
+        Ok(())
+    }
+
+    fn load_input_layernorm_at_layer(
+        &mut self,
+        layer_id: usize,
+        weights: &SafeTensorsHelper,
+        device: &B::Device,
+    ) -> Result<()> {
+        let layer_prefix = format!("model.layers.{}", layer_id);
+
+        self.model.layers[layer_id].input_layernorm.gamma = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 1, Float>::from_data(
+                weights.get(&format!("{}.input_layernorm.weight", layer_prefix))?, device
+            ),
+        );
+
+        Ok(())
+    }
+
+    fn load_post_attention_layernorm_at_layer(
+        &mut self,
+        layer_id: usize,
+        weights: &SafeTensorsHelper,
+        device: &B::Device,
+    ) -> Result<()> {
+        let layer_prefix = format!("model.layers.{}", layer_id);
+
+        self.model.layers[layer_id].post_attention_layernorm.gamma = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 1, Float>::from_data(
+                weights.get(&format!("{}.post_attention_layernorm.weight", layer_prefix))?, device
+            ),
+        );
+
+        Ok(())
+    }
+
+    fn load_rms_norm(&mut self, weights: &SafeTensorsHelper, device: &B::Device) -> Result<()> {
+        self.model.norm.gamma = Param::initialized(
+            ParamId::new(),
+            Tensor::<B, 1, Float>::from_data(weights.get("model.norm.weight")?, device),
+        );
+
+        Ok(())
     }
 }
 
@@ -532,7 +719,7 @@ impl<B: Backend> Qwen3<B> {
         let config = Qwen3::<B>::create_config(config_path)?;
 
         let model: Qwen3Model<B> =
-            Qwen3Model::new(&config, device).from_pretrained(model_ckpt_path);
+            Qwen3Model::new(&config, device).from_pretrained(model_ckpt_path, device)?;
 
         Ok(Self {
             tokenizer,
@@ -558,10 +745,10 @@ impl<B: Backend> Qwen3<B> {
 
 impl<B: Backend> Model for Qwen3<B> {
     fn generate(&self, msgs: ChatCompletionParameters) -> Result<ChatCompletionResponse> {
-        let num_samples = msgs.max_tokens.unwrap_or(10);
-        let random_seed = msgs.seed.unwrap_or(123456);
-        let temperature = msgs.temperature.unwrap_or(1.0);
-        let top_p = msgs.top_p.unwrap_or(1.0);
+        let num_samples = msgs.max_tokens.unwrap_or(2);
+        let _random_seed = msgs.seed.unwrap_or(123456);
+        let _temperature = msgs.temperature.unwrap_or(1.0);
+        let _top_p = msgs.top_p.unwrap_or(1.0);
         // TODO: top_k <- model config file (rather than the ChatCompletionParameters)
 
         let sampler = MultinomialSampler::new();
