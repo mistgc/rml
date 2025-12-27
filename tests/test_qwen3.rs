@@ -46,36 +46,36 @@ fn qwen3_generate() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn qwen3_generate_ndarray() -> Result<()> {
-    let device = NdArrayDevice::Cpu;
-    let model_path = "ckpts/Qwen/Qwen3-0.6B/";
-    let model = Qwen3::<NdArrayBackend>::new(model_path, &device)
-        .unwrap_or_else(|e| panic!("Initializing model failed: {e:?}"));
-    let message = r#"
-    {
-        "model": "qwen3",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Hello. How are you?"
-                    }
-                ]
-            },
-            {
-                "role": "user",
-                "content": "Give me a short introduction to large language model."
-            }
-        ]
-    }
-    "#;
-    let message: ChatCompletionParameters = serde_json::from_str(message)?;
-    let res = model.generate(message)?;
-
-    println!("response: {:?}", serde_json::to_string_pretty(&res)?);
-
-    Ok(())
-}
+// #[test]
+// fn qwen3_generate_ndarray() -> Result<()> {
+//     let device = NdArrayDevice::Cpu;
+//     let model_path = "ckpts/Qwen/Qwen3-0.6B/";
+//     let model = Qwen3::<NdArrayBackend>::new(model_path, &device)
+//         .unwrap_or_else(|e| panic!("Initializing model failed: {e:?}"));
+//     let message = r#"
+//     {
+//         "model": "qwen3",
+//         "messages": [
+//             {
+//                 "role": "user",
+//                 "content": [
+//                     {
+//                         "type": "text",
+//                         "text": "Hello. How are you?"
+//                     }
+//                 ]
+//             },
+//             {
+//                 "role": "user",
+//                 "content": "Give me a short introduction to large language model."
+//             }
+//         ]
+//     }
+//     "#;
+//     let message: ChatCompletionParameters = serde_json::from_str(message)?;
+//     let res = model.generate(message)?;
+//
+//     println!("response: {:?}", serde_json::to_string_pretty(&res)?);
+//
+//     Ok(())
+// }

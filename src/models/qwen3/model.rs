@@ -126,6 +126,9 @@ impl<B: Backend> Qwen3Attention<B> {
         _cache_position: Option<Tensor<B, 1, Int>>,
     ) -> (Tensor<B, 3>, Option<Tensor<B, 4>>) {
         let input_shape = hidden_states.shape(); // [B, S, H]
+        let batch_size = input_shape[0].to_usize();
+        let seq_len = input_shape[1].to_usize();
+
         let hidden_shape: [i32; 4] = [
             input_shape[0].to_i32(),
             input_shape[1].to_i32(),
@@ -159,12 +162,14 @@ impl<B: Backend> Qwen3Attention<B> {
         let (query_states, key_states) =
             apply_rotary_pos_emb(query_states, key_states, cos.clone(), sin.clone(), None);
 
+        let causal_mask = create_causal_mask::<B>(batch_size, seq_len, &hidden_states.device());
+
         let (attn_output, attn_weights) = eager_attention_forward(
             self,
             query_states,
             key_states,
             value_states,
-            attention_mask,
+            Some(causal_mask),
             self.scaling,
             None,
         ); // [B, S, N, D]
@@ -196,7 +201,7 @@ pub fn eager_attention_forward<B: Backend>(
     q: Tensor<B, 4>, // [B, N_head, S, D]
     k: Tensor<B, 4>, // [B, N_kv, S, D]
     v: Tensor<B, 4>, // [B, N_kv, S, D]
-    attn_mask: Option<Tensor<B, 2>>,
+    attn_mask: Option<Tensor<B, 4>>,
     scaling: f32,
     dropout: Option<&nn::Dropout>,
 ) -> (Tensor<B, 4>, Tensor<B, 4>) {
@@ -205,7 +210,7 @@ pub fn eager_attention_forward<B: Backend>(
     let mut attn_weights = Tensor::matmul(q, key_states.swap_dims(2, 3)).mul_scalar(scaling); // [B, N_head, S, S]
 
     if let Some(attn_mask) = attn_mask {
-        attn_weights = attn_weights + attn_mask.unsqueeze_dim(2);
+        attn_weights = attn_weights + attn_mask;
     }
 
     let mut attn_weights = softmax(attn_weights, 3);
@@ -238,6 +243,29 @@ pub fn rope_init_fn<B: Backend>(config: &Qwen3Config, device: &B::Device) -> (Te
     let inv_freq = Tensor::from_data([1.0], device).div(base.powf(exp));
 
     (inv_freq, attention_factor)
+}
+
+fn create_causal_mask<B: Backend>(
+    batch_size: usize,
+    seq_len: usize,
+    device: &B::Device,
+) -> Tensor<B, 4> {
+    let mut mask_data = vec![0f32; seq_len * seq_len];
+
+    for i in 0..seq_len {
+        for j in 0..seq_len {
+            if j > i {
+                mask_data[i * seq_len + j] = -1e9;
+            }
+        }
+    }
+
+    let mask_2d: Tensor<B, 2> =
+        Tensor::from_data(TensorData::new(mask_data, [seq_len, seq_len]), device);
+    let mask_3d: Tensor<B, 3> = mask_2d.unsqueeze_dim(0);
+    let mask_4d: Tensor<B, 4> = mask_3d.unsqueeze_dim(0);
+
+    mask_4d.expand([batch_size as i32, 1, seq_len as i32, seq_len as i32])
 }
 
 pub fn generate_rope_modulation_functions<B: Backend>(
@@ -512,10 +540,25 @@ impl<B: Backend> Qwen3Model<B> {
 
     /// Load the `.safetensors` file
     pub fn from_pretrained<P: AsRef<Path>>(mut self, path: P, device: &B::Device) -> Result<Self> {
-        let weights = SafeTensorsHelper::new(path)?;
+        let weights = SafeTensorsHelper::new(&path)?;
+        let config_path = path.as_ref().parent().unwrap().join("config.json");
+        let config_str = std::fs::read_to_string(config_path)?;
+        let config: Qwen3Config = serde_json::from_str(&config_str)?;
 
-        self.load_lm_head(&weights, device)?;
-        self.load_model(&weights, device)?;
+        if config.tie_word_embeddings {
+            // When tie_word_embeddings is true, lm_head should share weights with embed_tokens
+            // We'll load embed_tokens first, then use it for lm_head
+            self.load_model(&weights, device)?;
+            // Share embed_tokens.weight with lm_head
+            self.lm_head.weight = Param::initialized(
+                ParamId::new(),
+                self.model.embed_tokens.weight.val().transpose(),
+            );
+        } else {
+            // Load lm_head separately when not tied
+            self.load_lm_head(&weights, device)?;
+            self.load_model(&weights, device)?;
+        }
 
         // println!("{:?}", weights);
 
@@ -523,10 +566,10 @@ impl<B: Backend> Qwen3Model<B> {
     }
 
     fn load_lm_head(&mut self, weights: &SafeTensorsHelper, device: &B::Device) -> Result<()> {
-        self.lm_head.weight = Param::initialized(
-            ParamId::new(),
-            Tensor::<B, 2, Float>::from_data(weights.get("lm_head.weight")?, device).transpose(),
-        );
+        let weight_data = Tensor::<B, 3, Float>::from_data(weights.get("lm_head.weight")?, device);
+        let dims = weight_data.dims();
+        let weight_2d = weight_data.reshape([dims[1], dims[2]]);
+        self.lm_head.weight = Param::initialized(ParamId::new(), weight_2d);
 
         Ok(())
     }
@@ -768,7 +811,7 @@ impl<B: Backend> Qwen3<B> {
 
 impl<B: Backend> Model for Qwen3<B> {
     fn generate(&self, msgs: ChatCompletionParameters) -> Result<ChatCompletionResponse> {
-        let num_samples = msgs.max_tokens.unwrap_or(2);
+        let num_samples = msgs.max_tokens.unwrap_or(64);
         let _random_seed = msgs.seed.unwrap_or(123456);
         let temperature = msgs.temperature.unwrap_or(1.0);
         let top_p = msgs.top_p.unwrap_or(1.0);
@@ -793,11 +836,15 @@ impl<B: Backend> Model for Qwen3<B> {
                 TensorData::new(input_ids.clone(), [1, seq_len]),
                 &self.device,
             );
+
+            let position_ids =
+                Tensor::<B, 1, Int>::arange(0..seq_len as i64, &self.device).reshape([1, seq_len]);
+
             let input = Qwen3ModelInput {
                 input_ids: Some(tensor_ids),
                 attention_mask: None,
                 inputs_embeds: None,
-                position_ids: None,
+                position_ids: Some(position_ids),
                 past_key_values: None,
                 use_cache: false,
                 cache_position: None,
@@ -815,7 +862,7 @@ impl<B: Backend> Model for Qwen3<B> {
 
             input_ids.push(next_token);
 
-            // Check for EOS token (commonly token ID 2)
+            // Check for EOS token
             if next_token == self.eos_token_id {
                 break;
             }

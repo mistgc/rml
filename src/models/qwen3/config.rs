@@ -34,4 +34,7 @@ pub struct Qwen3Config {
     pub bos_token_id: u32,
 
     pub eos_token_id: u32,
+
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
 }

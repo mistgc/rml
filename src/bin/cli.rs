@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
-use burn::backend::wgpu::WgpuDevice;
 use burn::backend::Wgpu;
+use burn::backend::wgpu::WgpuDevice;
 use openai_dive::v1::resources::chat::ChatCompletionParameters;
 use rml::models::common::Model;
 use rml::models::qwen3::model::Qwen3;
