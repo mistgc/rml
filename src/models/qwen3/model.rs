@@ -12,10 +12,15 @@ use burn::{
     tensor::activation::softmax,
 };
 
-
-use openai_dive::v1::resources::chat::{ChatCompletionParameters, ChatCompletionResponse};
+use openai_dive::v1::resources::chat::ChatMessage;
+use openai_dive::v1::resources::chat::ChatMessageContent;
+use openai_dive::v1::resources::chat::{
+    ChatCompletionChoice, ChatCompletionParameters, ChatCompletionResponse,
+};
+use openai_dive::v1::resources::shared::Usage;
 use std::{fs, path::Path};
 use tokenizers::Tokenizer;
+use uuid::Uuid;
 
 #[derive(Module, Debug)]
 pub struct Qwen3RMSNorm<B: Backend> {
@@ -539,11 +544,7 @@ impl<B: Backend> Qwen3Model<B> {
         Ok(())
     }
 
-    fn load_embed_token(
-        &mut self,
-        weights: &SafeTensorsHelper,
-        device: &B::Device,
-    ) -> Result<()> {
+    fn load_embed_token(&mut self, weights: &SafeTensorsHelper, device: &B::Device) -> Result<()> {
         self.model.embed_tokens.weight = Param::initialized(
             ParamId::new(),
             Tensor::<B, 2, Float>::from_data(weights.get("model.embed_tokens.weight")?, device),
@@ -579,43 +580,53 @@ impl<B: Backend> Qwen3Model<B> {
         self.model.layers[layer_id].self_attn.q_proj.weight = Param::initialized(
             ParamId::new(),
             Tensor::<B, 2, Float>::from_data(
-                weights.get(&format!("{}.q_proj.weight", attn_prefix))?, device
-            ).transpose(),
+                weights.get(&format!("{}.q_proj.weight", attn_prefix))?,
+                device,
+            )
+            .transpose(),
         );
 
         self.model.layers[layer_id].self_attn.k_proj.weight = Param::initialized(
             ParamId::new(),
             Tensor::<B, 2, Float>::from_data(
-                weights.get(&format!("{}.k_proj.weight", attn_prefix))?, device
-            ).transpose(),
+                weights.get(&format!("{}.k_proj.weight", attn_prefix))?,
+                device,
+            )
+            .transpose(),
         );
 
         self.model.layers[layer_id].self_attn.v_proj.weight = Param::initialized(
             ParamId::new(),
             Tensor::<B, 2, Float>::from_data(
-                weights.get(&format!("{}.v_proj.weight", attn_prefix))?, device
-            ).transpose(),
+                weights.get(&format!("{}.v_proj.weight", attn_prefix))?,
+                device,
+            )
+            .transpose(),
         );
 
         self.model.layers[layer_id].self_attn.o_proj.weight = Param::initialized(
             ParamId::new(),
             Tensor::<B, 2, Float>::from_data(
-                weights.get(&format!("{}.o_proj.weight", attn_prefix))?, device
-            ).transpose(),
+                weights.get(&format!("{}.o_proj.weight", attn_prefix))?,
+                device,
+            )
+            .transpose(),
         );
 
         // Load RMS norm weights
         self.model.layers[layer_id].self_attn.q_norm.gamma = Param::initialized(
             ParamId::new(),
             Tensor::<B, 1, Float>::from_data(
-                weights.get(&format!("{}.q_norm.weight", attn_prefix))?, device
+                weights.get(&format!("{}.q_norm.weight", attn_prefix))?,
+                device,
             ),
         );
 
         self.model.layers[layer_id].self_attn.k_norm.gamma = Param::initialized(
             ParamId::new(),
             Tensor::<B, 1, Float>::from_data(
-                weights.get(&format!("{}.k_norm.weight", attn_prefix))?, device
+                weights.get(&format!("{}.k_norm.weight", attn_prefix))?,
+                device,
             ),
         );
 
@@ -634,22 +645,28 @@ impl<B: Backend> Qwen3Model<B> {
         self.model.layers[layer_id].mlp.gate_proj.weight = Param::initialized(
             ParamId::new(),
             Tensor::<B, 2, Float>::from_data(
-                weights.get(&format!("{}.gate_proj.weight", mlp_prefix))?, device
-            ).transpose(),
+                weights.get(&format!("{}.gate_proj.weight", mlp_prefix))?,
+                device,
+            )
+            .transpose(),
         );
 
         self.model.layers[layer_id].mlp.up_proj.weight = Param::initialized(
             ParamId::new(),
             Tensor::<B, 2, Float>::from_data(
-                weights.get(&format!("{}.up_proj.weight", mlp_prefix))?, device
-            ).transpose(),
+                weights.get(&format!("{}.up_proj.weight", mlp_prefix))?,
+                device,
+            )
+            .transpose(),
         );
 
         self.model.layers[layer_id].mlp.down_proj.weight = Param::initialized(
             ParamId::new(),
             Tensor::<B, 2, Float>::from_data(
-                weights.get(&format!("{}.down_proj.weight", mlp_prefix))?, device
-            ).transpose(),
+                weights.get(&format!("{}.down_proj.weight", mlp_prefix))?,
+                device,
+            )
+            .transpose(),
         );
 
         Ok(())
@@ -666,7 +683,8 @@ impl<B: Backend> Qwen3Model<B> {
         self.model.layers[layer_id].input_layernorm.gamma = Param::initialized(
             ParamId::new(),
             Tensor::<B, 1, Float>::from_data(
-                weights.get(&format!("{}.input_layernorm.weight", layer_prefix))?, device
+                weights.get(&format!("{}.input_layernorm.weight", layer_prefix))?,
+                device,
             ),
         );
 
@@ -684,7 +702,8 @@ impl<B: Backend> Qwen3Model<B> {
         self.model.layers[layer_id].post_attention_layernorm.gamma = Param::initialized(
             ParamId::new(),
             Tensor::<B, 1, Float>::from_data(
-                weights.get(&format!("{}.post_attention_layernorm.weight", layer_prefix))?, device
+                weights.get(&format!("{}.post_attention_layernorm.weight", layer_prefix))?,
+                device,
             ),
         );
 
@@ -706,6 +725,8 @@ pub struct Qwen3<B: Backend> {
     chat_template: ChatTemplate,
     model: Qwen3Model<B>,
     device: B::Device,
+    bos_token_id: u32,
+    eos_token_id: u32,
 }
 
 impl<B: Backend> Qwen3<B> {
@@ -722,6 +743,8 @@ impl<B: Backend> Qwen3<B> {
             Qwen3Model::new(&config, device).from_pretrained(model_ckpt_path, device)?;
 
         Ok(Self {
+            bos_token_id: config.bos_token_id,
+            eos_token_id: config.eos_token_id,
             tokenizer,
             device: device.clone(),
             model,
@@ -747,20 +770,22 @@ impl<B: Backend> Model for Qwen3<B> {
     fn generate(&self, msgs: ChatCompletionParameters) -> Result<ChatCompletionResponse> {
         let num_samples = msgs.max_tokens.unwrap_or(2);
         let _random_seed = msgs.seed.unwrap_or(123456);
-        let _temperature = msgs.temperature.unwrap_or(1.0);
-        let _top_p = msgs.top_p.unwrap_or(1.0);
-        // TODO: top_k <- model config file (rather than the ChatCompletionParameters)
+        let temperature = msgs.temperature.unwrap_or(1.0);
+        let top_p = msgs.top_p.unwrap_or(1.0);
 
-        let sampler = MultinomialSampler::new();
-        // let sampler = SimpleSampler::new();
+        let sampler = MultinomialSampler::new_with_params(temperature, top_p)
+            .map_err(|e| anyhow!("Failed to create sampler: {}", e))?;
         let rendered_text = self.chat_template.render(&msgs)?;
 
         let mut input_ids = self
             .tokenizer
             .encode(rendered_text.clone(), true)
-            .map_err(|e| anyhow!(format!("Tokenizer encode err: {}", e)))?
+            .map_err(|e| anyhow!("Tokenizer encode error: {}", e))?
             .get_ids()
             .to_vec();
+
+        // Store original prompt length
+        let prompt_len = input_ids.len();
 
         for _ in 0..num_samples {
             let seq_len = input_ids.len();
@@ -780,22 +805,68 @@ impl<B: Backend> Model for Qwen3<B> {
 
             let output = self.model.forward(input); // logits: [B, S, C]
             let probs = softmax(output.logits.slice(s!(.., -1, ..)).squeeze_dim(1), 1); // [B, C]
+
+            // Enhanced sampling with temperature and top-p filtering
             let next_token = sampler
-                .sample(probs)
+                .sample_with_filtering(probs)
                 .squeeze_dim::<1>(0)
                 .into_scalar()
                 .to_u32();
 
             input_ids.push(next_token);
+
+            // Check for EOS token (commonly token ID 2)
+            if next_token == self.eos_token_id {
+                break;
+            }
         }
 
-        println!(
-            "{}",
-            self.tokenizer
-                .decode(input_ids.as_ref(), true)
-                .unwrap_or("NULL".to_owned())
-        );
+        // Extract only the generated tokens (not including prompt)
+        let generated_ids = &input_ids[prompt_len..];
+        let generated_text = self
+            .tokenizer
+            .decode(generated_ids, true)
+            .map_err(|e| anyhow!("Token decode error: {}", e))?
+            .trim()
+            .to_string();
 
-        todo!()
+        // Create ChatCompletionResponse
+        let response = ChatCompletionResponse {
+            id: Some(format!("chatcmpl-{}", Uuid::new_v4())),
+            object: "chat.completion".to_string(),
+            created: (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()) as u32,
+            model: msgs.model.clone(),
+            choices: vec![ChatCompletionChoice {
+                index: 0,
+                message: ChatMessage::Assistant {
+                    content: Some(ChatMessageContent::Text(generated_text)),
+                    reasoning_content: None,
+                    refusal: None,
+                    name: None,
+                    audio: None,
+                    tool_calls: None,
+                },
+                finish_reason: None,
+                logprobs: None,
+            }],
+            usage: Some(Usage {
+                prompt_tokens: Some(prompt_len as u32),
+                completion_tokens: Some(generated_ids.len() as u32),
+                total_tokens: input_ids.len() as u32,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+                input_tokens: None,
+                input_tokens_details: None,
+                output_tokens: None,
+                output_tokens_details: None,
+            }),
+            system_fingerprint: None,
+            service_tier: None,
+        };
+
+        Ok(response)
     }
 }

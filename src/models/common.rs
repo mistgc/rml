@@ -1,5 +1,3 @@
-
-
 use anyhow::Result;
 use openai_dive::v1::resources::chat::{ChatCompletionParameters, ChatCompletionResponse};
 

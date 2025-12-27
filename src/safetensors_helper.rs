@@ -1,7 +1,5 @@
 use anyhow::{Result, anyhow};
-use burn::{
-    tensor::TensorData,
-};
+use burn::tensor::TensorData;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},

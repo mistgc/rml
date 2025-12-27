@@ -12,7 +12,7 @@ build:
 
 test:
 	@echo "Running tests..."
-	@RUST_BACKTRACE=1 cargo test
+	@RUST_BACKTRACE=1 cargo test -- --nocapture
 
 clean:
 	@echo "Cleaning project..."
@@ -20,7 +20,7 @@ clean:
 
 fmt:
 	@echo "Formatting code..."
-	@cargo fmt --all -- --check
+	@cargo fmt --all
 
 lint:
 	@echo "Linting code..."

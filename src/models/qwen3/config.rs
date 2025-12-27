@@ -30,4 +30,8 @@ pub struct Qwen3Config {
     pub attention_bias: bool,
 
     pub attention_dropout: f32,
+
+    pub bos_token_id: u32,
+
+    pub eos_token_id: u32,
 }
